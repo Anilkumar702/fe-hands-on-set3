@@ -1,139 +1,34 @@
-import { useEffect, useMemo, useReducer, useState, type FormEvent } from 'react';
-import { AlarmClock, ArrowRight, Check, CircleHelp, Clock3, DoorOpen, Hourglass, Plus, Users, X } from 'lucide-react';
-import { createId, initialQueueState, parseQueueState, queueReducer, type MeetingRequest } from './queue';
+import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import { api, type Booking, type Room } from '../bookingApi';
+import { useSearchParams } from 'react-router-dom';
 
-const STORAGE_KEY = 'roomly.queue.v1';
-
-function readStoredQueue() {
-  try { return parseQueueState(window.localStorage.getItem(STORAGE_KEY)); }
-  catch { return initialQueueState; }
-}
-
-function formatElapsed(startedAt: number, now: number) {
-  const elapsed = Math.max(0, Math.floor((now - startedAt) / 60_000));
-  return `${String(Math.floor(elapsed / 60)).padStart(2, '0')}:${String(elapsed % 60).padStart(2, '0')}`;
-}
-
-function formatClock(timestamp: number) {
-  return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(timestamp);
-}
-
+const today = () => new Date().toISOString().slice(0, 10);
+const overlaps = (start: string, end: string, item: Booking) => start < item.end && item.start < end;
 export function RoomBookingPage() {
-  const [state, dispatch] = useReducer(queueReducer, undefined, readStoredQueue);
-  const [now, setNow] = useState(Date.now());
-  const [name, setName] = useState('');
-  const [purpose, setPurpose] = useState('');
-  const [duration, setDuration] = useState(30);
-  const [error, setError] = useState('');
-
-  useEffect(() => {
-    try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
-    catch { /* The in-memory queue still works when storage is unavailable. */ }
-  }, [state]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  const estimatedWait = useMemo(() => {
-    const activeRemaining = state.current
-      ? Math.max(0, state.current.durationMinutes - Math.floor((now - state.current.startedAt) / 60_000)) : 0;
-    return activeRemaining + state.waiting.reduce((total, item) => total + item.durationMinutes, 0);
-  }, [now, state]);
-
-  function joinQueue(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const cleanName = name.trim();
-    const cleanPurpose = purpose.trim();
-    if (!cleanName || !cleanPurpose) {
-      setError('Add your name and what you need the room for.');
-      return;
-    }
-    const request: MeetingRequest = {
-      id: createId(), name: cleanName, purpose: cleanPurpose,
-      durationMinutes: duration, joinedAt: Date.now(),
-    };
-    dispatch({ type: 'join', request, now: Date.now() });
-    setName('');
-    setPurpose('');
-    setError('');
+  const [params, setParams] = useSearchParams();
+  const roomId = params.get('room') ?? 'cedar', date = params.get('date') ?? today();
+  const [rooms, setRooms] = useState<Room[]>([]), [bookings, setBookings] = useState<Booking[]>([]), [title, setTitle] = useState(''), [start, setStart] = useState('09:00'), [end, setEnd] = useState('10:00'), [emails, setEmails] = useState<string[]>(['']), [errors, setErrors] = useState<Record<string, string>>({}), [notice, setNotice] = useState('');
+  useEffect(() => { if (!params.has('room') || !params.has('date')) setParams({ room: roomId, date }, { replace: true }); }, [date, params, roomId, setParams]);
+  const refresh = useCallback(async () => { setBookings(await api.list(roomId, date)); }, [roomId, date]);
+  useEffect(() => { api.rooms().then(setRooms); }, []);
+  useEffect(() => { refresh().catch(() => setNotice('Could not load bookings.')); }, [refresh]);
+  function update(patch: Record<string, string>) { setParams({ room: patch.room ?? roomId, date: patch.date ?? date }); }
+  async function submit(event: FormEvent) {
+    event.preventDefault(); setNotice(''); const next: Record<string, string> = {};
+    const attendeeList = emails.map((x) => x.trim());
+    if (!title.trim()) next.title = 'Enter a meeting title.';
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(start) || start < '09:00' || start >= '18:00') next.start = 'Choose a start between 09:00 and 18:00.';
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(end) || end <= start || end > '18:00') next.end = 'End must be after start and no later than 18:00.';
+    if (end > start && end <= '18:00' && start >= '09:00' && (endToMinutes(end) - endToMinutes(start) > 240)) next.end = 'A booking can be at most 4 hours.';
+    if (attendeeList.some((x) => !/^\S+@\S+\.\S+$/.test(x))) next.attendees = 'Enter a valid email for each attendee.';
+    if (attendeeList.some((x, i) => attendeeList.slice(0, i).some((other) => other.toLowerCase() === x.toLowerCase()))) next.attendees = 'Attendee emails must be unique.';
+    const conflicting = bookings.find((b) => overlaps(start, end, b));
+    if (conflicting) next.start = `Overlaps “${conflicting.title}” (${conflicting.start}–${conflicting.end}).`;
+    setErrors(next); if (Object.keys(next).length) return;
+    try { await api.create({ roomId, date, title: title.trim(), start, end, attendees: attendeeList }); await refresh(); setTitle(''); setEmails(['']); setNotice('Booking created.'); }
+    catch (error) { setNotice(error instanceof Error ? error.message : 'Could not create booking.'); }
   }
-
-  return (
-    <div className="booking-page">
-      <div className="page-heading">
-        <div>
-          <div className="eyebrow"><span className="eyebrow-line" /> QUESTION 01 <span className="eyebrow-dot">·</span> ROOM BOOKING</div>
-          <h1>A room for every<br /><span>good conversation.</span></h1>
-          <p className="page-intro">One room, one line. Join the queue and we’ll make sure everyone gets a fair turn.</p>
-        </div>
-        <div className="heading-stats">
-          <div className="stat-label">YOUR PLACE IN LINE</div>
-          <div className="stat-number">{state.waiting.length + (state.current ? 1 : 0)}<span> people</span></div>
-          <div className="stat-note"><Clock3 size={13} /> ~{estimatedWait} min until you’re free</div>
-        </div>
-      </div>
-
-      <div className="booking-grid">
-        <section className="card queue-card" aria-labelledby="queue-title">
-          <div className="section-heading">
-            <div><span className="section-kicker">LIVE ROOM STATUS</span><h2 id="queue-title">The queue</h2></div>
-            <span className={state.current ? 'live-pill busy' : 'live-pill free'}><span className="status-dot" />{state.current ? 'IN SESSION' : 'ROOM FREE'}</span>
-          </div>
-
-          {state.current ? (
-            <div className="current-session">
-              <div className="session-topline"><span className="session-label"><span className="pulse-dot" /> HAPPENING NOW</span><span className="session-started">Started {formatClock(state.current.startedAt)}</span></div>
-              <div className="current-person"><div className="avatar avatar-violet">{state.current.name.charAt(0).toUpperCase()}</div><div className="person-copy"><strong>{state.current.name}</strong><span>{state.current.purpose}</span></div><div className="elapsed"><span>{formatElapsed(state.current.startedAt, now)}</span><small>ELAPSED</small></div></div>
-              <div className="session-bottom"><span><AlarmClock size={14} /> {state.current.durationMinutes} min planned</span><button className="finish-button" onClick={() => dispatch({ type: 'finish', now: Date.now() })}>End meeting <Check size={14} /></button></div>
-            </div>
-          ) : (
-            <div className="room-free"><div className="free-icon"><DoorOpen size={21} /></div><div><strong>The room is open</strong><span>Be the first to claim a spot.</span></div></div>
-          )}
-
-          <div className="queue-divider"><span>UP NEXT</span><span>{state.waiting.length} {state.waiting.length === 1 ? 'person' : 'people'} waiting</span></div>
-          {state.waiting.length ? (
-            <ol className="waiting-list">
-              {state.waiting.map((person, index) => (
-                <li className="waiting-row" key={person.id}>
-                  <span className="queue-position">{String(index + 1).padStart(2, '0')}</span>
-                  <div className="avatar avatar-sand">{person.name.charAt(0).toUpperCase()}</div>
-                  <div className="person-copy"><strong>{person.name}</strong><span>{person.purpose}</span></div>
-                  <span className="waiting-duration"><Hourglass size={13} /> {person.durationMinutes}m</span>
-                  <button className="icon-button remove-button" aria-label={`Remove ${person.name} from queue`} onClick={() => dispatch({ type: 'cancel', id: person.id })}><X size={15} /></button>
-                </li>
-              ))}
-            </ol>
-          ) : (
-            <div className="queue-empty"><Users size={18} /><span>It’s quiet in here. The next meeting starts the moment someone joins.</span></div>
-          )}
-
-          {state.completed.length > 0 && <div className="recent-activity"><span className="section-kicker">RECENTLY WRAPPED</span>{state.completed.slice(0, 2).map((meeting) => <div className="history-row" key={`${meeting.id}-${meeting.endedAt}`}><span className="history-check"><Check size={12} /></span><span><strong>{meeting.name}</strong> finished at {formatClock(meeting.endedAt)}</span></div>)}</div>}
-        </section>
-
-        <aside className="join-column">
-          <section className="card join-card" aria-labelledby="join-title">
-            <div className="join-heading"><div className="join-icon"><Plus size={19} /></div><span className="section-kicker">YOUR TURN STARTS HERE</span></div>
-            <h2 id="join-title">Join the queue</h2>
-            <p className="card-description">We’ll hold your place. When the room clears, you’re next.</p>
-            <form onSubmit={joinQueue} noValidate>
-              <label className="field-label" htmlFor="name">YOUR NAME</label>
-              <input id="name" value={name} onChange={(event) => setName(event.target.value)} maxLength={48} placeholder="e.g. Alex Morgan" autoComplete="name" />
-              <label className="field-label" htmlFor="purpose">WHAT’S THE MEETING FOR?</label>
-              <input id="purpose" value={purpose} onChange={(event) => setPurpose(event.target.value)} maxLength={80} placeholder="e.g. Project kick-off" />
-              <label className="field-label" htmlFor="duration">HOW LONG DO YOU NEED?</label>
-              <div className="duration-options" id="duration">
-                {[15, 30, 45, 60].map((minutes) => <button type="button" key={minutes} className={duration === minutes ? 'duration-option selected' : 'duration-option'} aria-pressed={duration === minutes} onClick={() => setDuration(minutes)}>{minutes}<small>min</small></button>)}
-              </div>
-              {error && <p className="form-error" role="alert">{error}</p>}
-              <button className="primary-button" type="submit">{state.current ? 'Take my place' : 'Start my meeting'} <ArrowRight size={16} /></button>
-            </form>
-            <div className="fairness-note"><CircleHelp size={15} /><span>First come, first served. Joining the queue won’t interrupt the person in the room.</span></div>
-          </section>
-          <div className="queue-tip"><span className="tip-mark">✳</span><p><strong>A little room etiquette</strong><br />Keep meetings focused so everyone gets their time.</p></div>
-        </aside>
-      </div>
-    </div>
-  );
+  async function cancel(item: Booking) { if (!window.confirm(`Cancel “${item.title}”?`)) return; setBookings((old) => old.filter((b) => b.id !== item.id)); try { await api.cancel(item.id); setNotice('Booking cancelled.'); } catch { setBookings((old) => [...old, item].sort((a, b) => a.start.localeCompare(b.start))); setNotice('Could not cancel the booking; it has been restored.'); } }
+  return <div className="booking-page"><div className="page-heading"><div><div className="eyebrow">QUESTION 01 · ROOM BOOKING</div><h1>Book a room</h1><p className="page-intro">Choose a room and date, then find a time for your meeting.</p></div></div><div className="booking-grid"><section className="card queue-card"><h2>Room schedule</h2><div className="filters"><label>Room<select value={roomId} onChange={(e) => update({ room: e.target.value })}>{rooms.map((r) => <option key={r.id} value={r.id}>{r.name} · {r.capacity} people</option>)}</select></label><label>Date<input type="date" value={date} onChange={(e) => update({ date: e.target.value })}/></label></div><ol className="schedule-list">{bookings.map((b) => <li key={b.id}><b>{b.start}–{b.end}</b><span>{b.title}</span><button onClick={() => void cancel(b)}>Cancel</button></li>)}</ol>{!bookings.length && <p>No bookings yet. The room is free from 09:00 to 18:00.</p>}</section><section className="card join-card"><h2>New booking</h2><form onSubmit={(e) => void submit(e)} noValidate><label>Title<input value={title} onChange={(e) => setTitle(e.target.value)} />{errors.title && <small className="form-error">{errors.title}</small>}</label><div className="filters"><label>Start<input type="time" step={900} value={start} onChange={(e) => setStart(e.target.value)} />{errors.start && <small className="form-error">{errors.start}</small>}</label><label>End<input type="time" step={900} value={end} onChange={(e) => setEnd(e.target.value)} />{errors.end && <small className="form-error">{errors.end}</small>}</label></div><label>Attendees{emails.map((email, i) => <div className="email-row" key={i}><input type="email" value={email} onChange={(e) => setEmails((old) => old.map((x, j) => i === j ? e.target.value : x))} placeholder="name@example.com"/><button type="button" onClick={() => setEmails((old) => old.length > 1 ? old.filter((_, j) => i !== j) : [''])} aria-label="Remove attendee">×</button></div>)}{errors.attendees && <small className="form-error">{errors.attendees}</small>}<button className="text-button" type="button" onClick={() => setEmails((old) => [...old, ''])}>+ Add attendee</button></label><button className="primary-button">Create booking</button>{notice && <p role="status">{notice}</p>}</form></section></div></div>;
 }
+function endToMinutes(value: string) { const [h, m] = value.split(':').map(Number); return h * 60 + m; }

@@ -19,7 +19,7 @@ npm run build
 
 ## Routes
 
-- `/q1-room-booking` — FIFO meeting-room booking question.
+- `/q1-room-booking` — the first request gets the room; later requests wait in order, can cancel while waiting, and are promoted when a meeting ends. Queue state persists in local storage.
 - `/q2-find-a-time` — free meeting slots question.
 
 No calendar, scheduler, or timeline library performs the question logic.
